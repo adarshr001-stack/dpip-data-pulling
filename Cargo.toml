@@ -27,3 +27,8 @@ bytes = "1.10.1"
 tokio-stream = "0.1.17"
 rusqlite = "0.37.0"
 sysinfo = "0.37.2"
+
+
+
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"

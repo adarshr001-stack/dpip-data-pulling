@@ -1,3 +1,5 @@
+mod db;
+
 use std::net::TcpStream;
 use anyhow::{Result, Context, anyhow};
 use std::env;
@@ -24,8 +26,8 @@ use std::sync::Arc;
 use std::process;
 
 // --- Multi-threading Imports ---
-use tokio::sync::{Semaphore, Mutex};
-use std::collections::{HashSet, VecDeque};
+use tokio::sync::Semaphore;
+use deadpool_postgres::Pool;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -44,6 +46,14 @@ struct Config {
 
     upload_chunk_size: usize, // e.g., 10 * 1024 * 1024 for 10MB
     max_concurrent_uploads: usize, // Number of parallel threads
+    
+    // Database configuration
+    db_host: String,
+    db_port: u16,
+    db_user: String,
+    db_password: String,
+    db_name: String,
+    db_max_connections: usize,
 }
 
 impl Config {
@@ -68,67 +78,17 @@ impl Config {
             max_concurrent_uploads: env::var("MAX_CONCURRENT_UPLOADS")
                 .unwrap_or_else(|_| "4".to_string())
                 .parse::<usize>()?,
+            db_host: env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            db_port: env::var("DB_PORT")
+                .unwrap_or_else(|_| "5433".to_string())
+                .parse()?,
+            db_user: env::var("DB_USER").unwrap_or_else(|_| "transfer_user".to_string()),
+            db_password: env::var("DB_PASSWORD").unwrap_or_else(|_| "transfer_pass".to_string()),
+            db_name: env::var("DB_NAME").unwrap_or_else(|_| "file_transfers".to_string()),
+            db_max_connections: env::var("DB_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
         })
-    }
-}
-
-// Shared state to track file processing
-struct FileProcessingState {
-    files_in_progress: Mutex<HashSet<String>>,
-    files_completed: Mutex<HashSet<String>>,
-    files_failed: Mutex<HashSet<String>>,
-    file_queue: Mutex<VecDeque<String>>,
-}
-
-impl FileProcessingState {
-    fn new(files: Vec<String>) -> Self {
-        Self {
-            files_in_progress: Mutex::new(HashSet::new()),
-            files_completed: Mutex::new(HashSet::new()),
-            files_failed: Mutex::new(HashSet::new()),
-            file_queue: Mutex::new(files.into_iter().collect()),
-        }
-    }
-
-    // Try to claim a file for processing
-    async fn claim_next_file(&self) -> Option<String> {
-        let mut queue = self.file_queue.lock().await;
-        let mut in_progress = self.files_in_progress.lock().await;
-        
-        if let Some(file) = queue.pop_front() {
-            in_progress.insert(file.clone());
-            Some(file)
-        } else {
-            None
-        }
-    }
-
-    // Mark file as completed successfully
-    async fn mark_completed(&self, file: &str) {
-        let mut in_progress = self.files_in_progress.lock().await;
-        let mut completed = self.files_completed.lock().await;
-        
-        in_progress.remove(file);
-        completed.insert(file.to_string());
-    }
-
-    // Mark file as failed
-    async fn mark_failed(&self, file: &str) {
-        let mut in_progress = self.files_in_progress.lock().await;
-        let mut failed = self.files_failed.lock().await;
-        
-        in_progress.remove(file);
-        failed.insert(file.to_string());
-    }
-
-    // Get statistics
-    async fn get_stats(&self) -> (usize, usize, usize, usize) {
-        let queue = self.file_queue.lock().await;
-        let in_progress = self.files_in_progress.lock().await;
-        let completed = self.files_completed.lock().await;
-        let failed = self.files_failed.lock().await;
-        
-        (queue.len(), in_progress.len(), completed.len(), failed.len())
     }
 }
 
@@ -139,6 +99,21 @@ async fn main() -> Result<()> {
 
     println!("Loaded config: {:?}", cfg);
     println!("Max concurrent uploads: {}", cfg.max_concurrent_uploads);
+
+    // Initialize database connection pool
+    let db_config = db::DbConfig {
+        host: cfg.db_host.clone(),
+        port: cfg.db_port,
+        user: cfg.db_user.clone(),
+        password: cfg.db_password.clone(),
+        dbname: cfg.db_name.clone(),
+        max_connections: cfg.db_max_connections,
+    };
+    
+    let db_pool = db::create_pool(&db_config).await?;
+    
+    // Initialize database schema (create tables if not exist)
+    db::init_schema(&db_pool).await?;
 
     // Connect to the bank sftp server to list files (initial connection)
     let initial_sftp = create_sftp_session(&cfg).await?;
@@ -152,8 +127,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create shared state for tracking file processing
-    let state = Arc::new(FileProcessingState::new(all_files));
+    // Insert all files as pending (if not already exist)
+    db::insert_pending_files(&db_pool, &all_files).await?;
+    
+    // Reset any failed files to pending (retry logic)
+    db::reset_failed_to_pending(&db_pool).await?;
     
     // Create semaphore to limit concurrent uploads
     let semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_uploads));
@@ -161,12 +139,15 @@ async fn main() -> Result<()> {
     // Create S3 client (shared across all workers)
     let s3_client = Arc::new(create_s3_client(&cfg).await?);
     
+    // Wrap db_pool in Arc for sharing across workers
+    let db_pool = Arc::new(db_pool);
+    
     // Spawn worker tasks
     let mut handles = vec![];
     
     for worker_id in 0..cfg.max_concurrent_uploads {
         let cfg_clone = cfg.clone();
-        let state_clone = Arc::clone(&state);
+        let db_pool_clone = Arc::clone(&db_pool);
         let semaphore_clone = Arc::clone(&semaphore);
         let s3_client_clone = Arc::clone(&s3_client);
         
@@ -174,7 +155,7 @@ async fn main() -> Result<()> {
             worker_task(
                 worker_id,
                 cfg_clone,
-                state_clone,
+                db_pool_clone,
                 semaphore_clone,
                 s3_client_clone,
             ).await
@@ -191,39 +172,44 @@ async fn main() -> Result<()> {
     }
     
     // Print final statistics
-    let (remaining, in_progress, completed, failed) = state.get_stats().await;
+    let (pending, running, completed, failed) = db::get_stats(&db_pool).await?;
     println!("\n=== Final Statistics ===");
     println!("Completed: {}", completed);
     println!("Failed: {}", failed);
-    println!("In Progress: {}", in_progress);
-    println!("Remaining: {}", remaining);
+    println!("Running: {}", running);
+    println!("Pending: {}", pending);
     
     if failed > 0 {
-        println!("\n Some files failed to upload. Check logs above for details.");
+        println!("\nSome files failed to upload. Check logs above for details.");
     } else {
-        println!("\n All files transferred successfully!");
+        println!("\nAll files transferred successfully!");
     }
     
     Ok(())
 }
 
-// Worker task that processes files from the queue
+// Worker task that processes files from the database queue
 async fn worker_task(
     worker_id: usize,
     cfg: Config,
-    state: Arc<FileProcessingState>,
+    db_pool: Arc<Pool>,
     semaphore: Arc<Semaphore>,
     s3_client: Arc<S3Client>,
 ) {
     println!("[Worker {}] Started", worker_id);
     
     loop {
-        // Try to get the next file to process
-        let file_path = match state.claim_next_file().await {
-            Some(path) => path,
-            None => {
+        // Try to claim the next pending file from database
+        let file_path = match db::claim_next_file(&db_pool).await {
+            Ok(Some(path)) => path,
+            Ok(None) => {
                 println!("[Worker {}] No more files to process, shutting down", worker_id);
                 break;
+            }
+            Err(e) => {
+                eprintln!("[Worker {}] Database error claiming file: {}", worker_id, e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                continue;
             }
         };
         
@@ -244,25 +230,34 @@ async fn worker_task(
                 
                 match upload_to_storage(worker_id, &cfg_file, Arc::new(sftp), (*s3_client).clone()).await {
                     Ok(_) => {
-                        println!("[Worker {}]  Successfully uploaded: {}", worker_id, file_path);
-                        state.mark_completed(&file_path).await;
+                        println!("[Worker {}] Successfully uploaded: {}", worker_id, file_path);
+                        if let Err(e) = db::mark_completed(&db_pool, &file_path, &file_path).await {
+                            eprintln!("[Worker {}] Failed to mark file as completed in DB: {}", worker_id, e);
+                        }
                     }
                     Err(e) => {
-                        eprintln!("[Worker {}]  Failed to upload {}: {}", worker_id, file_path, e);
-                        state.mark_failed(&file_path).await;
+                        let error_msg = format!("{}", e);
+                        eprintln!("[Worker {}] Failed to upload {}: {}", worker_id, file_path, error_msg);
+                        if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                            eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                        }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[Worker {}]  Failed to create SFTP session for {}: {}", worker_id, file_path, e);
-                state.mark_failed(&file_path).await;
+                let error_msg = format!("Failed to create SFTP session: {}", e);
+                eprintln!("[Worker {}] {}: {}", worker_id, error_msg, file_path);
+                if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                    eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                }
             }
         }
         
         // Print current statistics
-        let (remaining, in_progress, completed, failed) = state.get_stats().await;
-        println!("[Worker {}] Progress: Remaining={}, InProgress={}, Completed={}, Failed={}", 
-                 worker_id, remaining, in_progress, completed, failed);
+        if let Ok((pending, running, completed, failed)) = db::get_stats(&db_pool).await {
+            println!("[Worker {}] Progress: Pending={}, Running={}, Completed={}, Failed={}", 
+                     worker_id, pending, running, completed, failed);
+        }
     }
 }
 

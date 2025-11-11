@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: file_transfer_db
+    environment:
+      POSTGRES_USER: transfer_user
+      POSTGRES_PASSWORD: transfer_pass
+      POSTGRES_DB: file_transfers
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transfer_user -d file_transfers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
