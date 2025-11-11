@@ -198,6 +198,18 @@ async fn worker_task(
 ) {
     println!("[Worker {}] Started", worker_id);
     
+    // Create one SFTP session for this worker (wrapped in Arc)
+    let mut sftp_session: Option<Arc<ssh2::Sftp>> = match create_sftp_session(&cfg).await {
+        Ok(session) => {
+            println!("[Worker {}] SFTP connection established", worker_id);
+            Some(Arc::new(session))
+        }
+        Err(e) => {
+            eprintln!("[Worker {}] Failed to create initial SFTP session: {}", worker_id, e);
+            None
+        }
+    };
+    
     loop {
         // Try to claim the next pending file from database
         let file_path = match db::claim_next_file(&db_pool).await {
@@ -218,38 +230,91 @@ async fn worker_task(
         
         println!("[Worker {}] Processing file: {}", worker_id, file_path);
         
-        // Create a new SFTP session for this worker
-        // (SFTP sessions are not thread-safe, each worker needs its own)
-        let sftp_result = create_sftp_session(&cfg).await;
+        // Ensure we have a valid SFTP session
+        if sftp_session.is_none() {
+            println!("[Worker {}] No active SFTP session, attempting to connect...", worker_id);
+            match create_sftp_session(&cfg).await {
+                Ok(session) => {
+                    println!("[Worker {}] SFTP reconnection successful", worker_id);
+                    sftp_session = Some(Arc::new(session));
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to create SFTP session: {}", e);
+                    eprintln!("[Worker {}] {}", worker_id, error_msg);
+                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                        eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                    }
+                    continue;
+                }
+            }
+        }
         
-        match sftp_result {
-            Ok(sftp) => {
-                // Process the file
-                let mut cfg_file = cfg.clone();
-                cfg_file.bank_remote_path = file_path.clone();
-                
-                match upload_to_storage(worker_id, &cfg_file, Arc::new(sftp), (*s3_client).clone()).await {
+        // Process the file with retry logic
+        let mut cfg_file = cfg.clone();
+        cfg_file.bank_remote_path = file_path.clone();
+        
+        let mut retry_count = 0;
+        const MAX_RETRIES: usize = 2;
+        
+        loop {
+            if let Some(ref sftp) = sftp_session {
+                match upload_to_storage(worker_id, &cfg_file, Arc::clone(sftp), (*s3_client).clone()).await {
                     Ok(_) => {
                         println!("[Worker {}] Successfully uploaded: {}", worker_id, file_path);
                         if let Err(e) = db::mark_completed(&db_pool, &file_path, &file_path).await {
                             eprintln!("[Worker {}] Failed to mark file as completed in DB: {}", worker_id, e);
                         }
+                        break; // Success, move to next file
                     }
                     Err(e) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("[Worker {}] Failed to upload {}: {}", worker_id, file_path, error_msg);
-                        if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
-                            eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                        eprintln!("[Worker {}] Failed to upload {} (attempt {}): {}", 
+                                 worker_id, file_path, retry_count + 1, error_msg);
+                        
+                        // Check if error might be connection-related
+                        let is_connection_error = error_msg.contains("Connection") 
+                            || error_msg.contains("SFTP") 
+                            || error_msg.contains("SSH")
+                            || error_msg.contains("channel")
+                            || error_msg.contains("session");
+                        
+                        if is_connection_error && retry_count < MAX_RETRIES {
+                            println!("[Worker {}] Connection error detected, attempting to reconnect...", worker_id);
+                            sftp_session = None; // Invalidate current session
+                            
+                            // Try to reconnect
+                            match create_sftp_session(&cfg).await {
+                                Ok(session) => {
+                                    println!("[Worker {}] SFTP reconnection successful, retrying file...", worker_id);
+                                    sftp_session = Some(Arc::new(session));
+                                    retry_count += 1;
+                                    continue; // Retry with new connection
+                                }
+                                Err(e) => {
+                                    eprintln!("[Worker {}] SFTP reconnection failed: {}", worker_id, e);
+                                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                                        eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                                    }
+                                    break; // Give up on this file
+                                }
+                            }
+                        } else {
+                            // Non-connection error or max retries reached
+                            if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                                eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
+                            }
+                            break; // Move to next file
                         }
                     }
                 }
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to create SFTP session: {}", e);
-                eprintln!("[Worker {}] {}: {}", worker_id, error_msg, file_path);
+            } else {
+                // This shouldn't happen as we check above, but handle it anyway
+                let error_msg = "No SFTP session available".to_string();
+                eprintln!("[Worker {}] {}", worker_id, error_msg);
                 if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
                     eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
                 }
+                break;
             }
         }
         
@@ -259,6 +324,8 @@ async fn worker_task(
                      worker_id, pending, running, completed, failed);
         }
     }
+    
+    println!("[Worker {}] Shutting down", worker_id);
 }
 
 use ssh2::Sftp;
