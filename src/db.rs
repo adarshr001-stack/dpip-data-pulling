@@ -8,9 +8,7 @@ CREATE TABLE IF NOT EXISTS file_transfers (
     sftp_file_name VARCHAR(1024) NOT NULL UNIQUE,
     status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
     storage_file_name VARCHAR(1024),
-    error TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_file_status ON file_transfers(status);
@@ -87,7 +85,7 @@ pub async fn reset_failed_to_pending(pool: &Pool) -> Result<usize> {
     
     let count = client
         .execute(
-            "UPDATE file_transfers SET status = 'pending', error = NULL, updated_at = NOW() WHERE status = 'failed' OR status = 'running'",
+            "UPDATE file_transfers SET status = 'pending', error = NULL WHERE status = 'failed' OR status = 'running'",
             &[],
         )
         .await
@@ -131,7 +129,7 @@ pub async fn claim_next_file(pool: &Pool) -> Result<Option<String>> {
     transaction
         .execute(
             "UPDATE file_transfers 
-             SET status = 'running', updated_at = NOW() 
+             SET status = 'running' 
              WHERE sftp_file_name = $1",
             &[&file_path],
         )
@@ -150,7 +148,7 @@ pub async fn mark_completed(pool: &Pool, sftp_file_name: &str, storage_file_name
     client
         .execute(
             "UPDATE file_transfers 
-             SET status = 'completed', storage_file_name = $1, updated_at = NOW() 
+             SET status = 'completed', storage_file_name = $1 
              WHERE sftp_file_name = $2",
             &[&storage_file_name, &sftp_file_name],
         )
@@ -167,7 +165,7 @@ pub async fn mark_failed(pool: &Pool, sftp_file_name: &str, error_msg: &str) -> 
     client
         .execute(
             "UPDATE file_transfers 
-             SET status = 'failed', error = $1, updated_at = NOW() 
+             SET status = 'failed', error = $1 
              WHERE sftp_file_name = $2",
             &[&error_msg, &sftp_file_name],
         )
