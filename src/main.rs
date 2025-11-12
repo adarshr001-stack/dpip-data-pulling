@@ -37,6 +37,7 @@ struct Config {
     bank_private_key_path: Option<String>,
     bank_private_key_content: Option<String>,
     bank_remote_path: String,
+    bank_password: String,
 
     storage_endpoint: String,
     storage_access_key: String,
@@ -64,9 +65,17 @@ impl Config {
             bank_host: env::var("BANK_HOST")?,
             bank_port: env::var("BANK_PORT")?.parse()?,
             bank_username: env::var("BANK_USERNAME")?,
+            
+
+
+            // Optional authentication fields
             bank_private_key_path: env::var("BANK_PRIVATE_KEY_PATH").ok(),
             bank_private_key_content: env::var("BANK_PRIVATE_KEY_CONTENT").ok(),
+            bank_password: env::var("BANK_PASSWORD").unwrap_or_default(),
+
             bank_remote_path: env::var("BANK_REMOTE_PATH")?,
+
+
             storage_endpoint: env::var("STORAGE_ENDPOINT")?,
             storage_access_key: env::var("STORAGE_ACCESS_KEY")?,
             storage_secret_key: env::var("STORAGE_SECRET_KEY")?,
@@ -368,84 +377,116 @@ fn list_sftp_files_recursively(sftp: &Sftp, path: &Path) -> Result<Vec<String>> 
     Ok(files)
 }
 
+
+
+// to establish SFTP connection using password authentication
+
 async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
-    // Connect to the SFTP server
-    let tcp = TcpStream::connect(format!("{}:{}", cfg.bank_host, cfg.bank_port))
-        .context("Failed to connect to SFTP server")?;
-    let mut sess = Session::new().context("Failed to create SSH session")?;
+    let tcp = TcpStream::connect(format!("{}:{}", cfg.bank_host, cfg.bank_port))?;
+    let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
-    sess.handshake().context("SSH handshake failed")?;
+    sess.handshake()?;
 
-    // Authenticate using private key
-    if let Some(ref key_content) = cfg.bank_private_key_content {
-        // Write the PEM key directly to temp file
-        let temp_key_path = format!("/tmp/sftp_temp_key_{}.pem", process::id());
-        
-        // Format the key properly - replace spaces with newlines in the base64 content
-        let formatted_key = if key_content.contains("-----BEGIN") && key_content.contains("-----END") {
-            // Extract header, content, and footer
-            let parts: Vec<&str> = key_content.split("-----").collect();
-            if parts.len() >= 5 {
-                let header = format!("-----{}-----", parts[1]);
-                let footer = format!("-----{}-----", parts[3]);
-                let content = parts[2].trim();
-                
-                // Split content into 64-character lines (standard PEM format)
-                let mut formatted_content = String::new();
-                for chunk in content.split_whitespace() {
-                    formatted_content.push_str(chunk);
-                }
-                
-                let mut lines = Vec::new();
-                let chars: Vec<char> = formatted_content.chars().collect();
-                for chunk in chars.chunks(64) {
-                    lines.push(chunk.iter().collect::<String>());
-                }
-                
-                format!("{}\n{}\n{}", header, lines.join("\n"), footer)
-            } else {
-                key_content.clone()
-            }
-        } else {
-            key_content.clone()
-        };
-        
-        fs::write(&temp_key_path, formatted_key)
-            .context("Failed to write private key to temporary file")?;
+    // Authenticate using username & password
+    sess.userauth_password(&cfg.bank_username, &cfg.bank_password)?;
+    println!(" Authenticated successfully!");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temp_key_path, fs::Permissions::from_mode(0o600))?;
-        }
-
-        // Authenticate using the temporary key file
-        sess.userauth_pubkey_file(
-            &cfg.bank_username,
-            None,
-            Path::new(&temp_key_path),
-            None,
-        ).context("SSH authentication failed")?;
-
-        // Clean up the temporary file
-        let _ = fs::remove_file(&temp_key_path);
-    } else if let Some(ref path) = cfg.bank_private_key_path {
-        sess.userauth_pubkey_file(&cfg.bank_username, None, Path::new(path), None)
-            .context("SSH authentication failed")?;
-    } else {
-        return Err(anyhow::anyhow!("No private key provided"));
-    }
 
     if !sess.authenticated() {
-        return Err(anyhow::anyhow!("SSH authentication failed"));
+        return Err(anyhow::anyhow!("Authentication failed"));
     }
-
-    // Open SFTP session
-    let sftp = sess.sftp().context("Failed to open SFTP session")?;
-        println!("✓ SFTP session established!");
+  
+    // Open SFTP channel
+    let sftp = sess.sftp()?;
+    println!(" SFTP session established!");
 
     Ok(sftp)
 }
+
+
+// to establish SFTP connection using ssh key authentication
+
+// async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
+//     // Connect to the SFTP server
+//     let tcp = TcpStream::connect(format!("{}:{}", cfg.bank_host, cfg.bank_port))
+//         .context("Failed to connect to SFTP server")?;
+//     let mut sess = Session::new().context("Failed to create SSH session")?;
+//     sess.set_tcp_stream(tcp);
+//     sess.handshake().context("SSH handshake failed")?;
+
+//     // Authenticate using private key
+//     if let Some(ref key_content) = cfg.bank_private_key_content {
+//         // Write the PEM key directly to temp file
+//         let temp_key_path = format!("/tmp/sftp_temp_key_{}.pem", process::id());
+        
+//         // Format the key properly - replace spaces with newlines in the base64 content
+//         let formatted_key = if key_content.contains("-----BEGIN") && key_content.contains("-----END") {
+//             // Extract header, content, and footer
+//             let parts: Vec<&str> = key_content.split("-----").collect();
+//             if parts.len() >= 5 {
+//                 let header = format!("-----{}-----", parts[1]);
+//                 let footer = format!("-----{}-----", parts[3]);
+//                 let content = parts[2].trim();
+                
+//                 // Split content into 64-character lines (standard PEM format)
+//                 let mut formatted_content = String::new();
+//                 for chunk in content.split_whitespace() {
+//                     formatted_content.push_str(chunk);
+//                 }
+                
+//                 let mut lines = Vec::new();
+//                 let chars: Vec<char> = formatted_content.chars().collect();
+//                 for chunk in chars.chunks(64) {
+//                     lines.push(chunk.iter().collect::<String>());
+//                 }
+                
+//                 format!("{}\n{}\n{}", header, lines.join("\n"), footer)
+//             } else {
+//                 key_content.clone()
+//             }
+//         } else {
+//             key_content.clone()
+//         };
+        
+//         fs::write(&temp_key_path, formatted_key)
+//             .context("Failed to write private key to temporary file")?;
+
+//         #[cfg(unix)]
+//         {
+//             use std::os::unix::fs::PermissionsExt;
+//             fs::set_permissions(&temp_key_path, fs::Permissions::from_mode(0o600))?;
+//         }
+
+//         // Authenticate using the temporary key file
+//         sess.userauth_pubkey_file(
+//             &cfg.bank_username,
+//             None,
+//             Path::new(&temp_key_path),
+//             None,
+//         ).context("SSH authentication failed")?;
+
+//         // Clean up the temporary file
+//         let _ = fs::remove_file(&temp_key_path);
+//     } else if let Some(ref path) = cfg.bank_private_key_path {
+//         sess.userauth_pubkey_file(&cfg.bank_username, None, Path::new(path), None)
+//             .context("SSH authentication failed")?;
+//     } else {
+//         return Err(anyhow::anyhow!("No private key provided"));
+//     }
+
+//     if !sess.authenticated() {
+//         return Err(anyhow::anyhow!("SSH authentication failed"));
+//     }
+
+//     // Open SFTP session
+//     let sftp = sess.sftp().context("Failed to open SFTP session")?;
+//         println!("✓ SFTP session established!");
+
+//     Ok(sftp)
+// }
+
+
+
 
 async fn create_s3_client(cfg: &Config) -> Result<S3Client> {
     let region = Region::new(cfg.storage_region.clone());
