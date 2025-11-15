@@ -2,19 +2,6 @@ use anyhow::{Result, Context};
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use tokio_postgres::NoTls;
 
-const CREATE_TABLE_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS file_transfers (
-    id SERIAL PRIMARY KEY,
-    sftp_file_name VARCHAR(1024) NOT NULL UNIQUE,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
-    storage_file_name VARCHAR(1024),
-    error TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_file_status ON file_transfers(status);
-CREATE INDEX IF NOT EXISTS idx_sftp_file_name ON file_transfers(sftp_file_name);
-"#;
-
 /// Database configuration
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -24,6 +11,7 @@ pub struct DbConfig {
     pub password: String,
     pub dbname: String,
     pub max_connections: usize,
+    pub table_name: String,
 }
 
 /// Create a connection pool
@@ -44,11 +32,27 @@ pub async fn create_pool(config: &DbConfig) -> Result<Pool> {
 }
 
 /// Initialize database schema
-pub async fn init_schema(pool: &Pool) -> Result<()> {
+pub async fn init_schema(pool: &Pool, table_name: &str) -> Result<()> {
     let client = pool.get().await.context("Failed to get database client")?;
     
+    let create_table_sql = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {} (
+            id SERIAL PRIMARY KEY,
+            sftp_file_name VARCHAR(1024) NOT NULL UNIQUE,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            storage_file_name VARCHAR(1024),
+            error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_file_status ON {}(status);
+        CREATE INDEX IF NOT EXISTS idx_sftp_file_name ON {}(sftp_file_name);
+        "#,
+        table_name, table_name, table_name
+    );
+    
     client
-        .batch_execute(CREATE_TABLE_SQL)
+        .batch_execute(&create_table_sql)
         .await
         .context("Failed to create database schema")?;
     
@@ -57,18 +61,20 @@ pub async fn init_schema(pool: &Pool) -> Result<()> {
 }
 
 /// Insert files as pending if they don't already exist
-pub async fn insert_pending_files(pool: &Pool, file_paths: &[String]) -> Result<usize> {
+pub async fn insert_pending_files(pool: &Pool, file_paths: &[String], table_name: &str) -> Result<usize> {
     let client = pool.get().await.context("Failed to get database client")?;
+    
+    let query = format!(
+        "INSERT INTO {} (sftp_file_name, status, storage_file_name) 
+         VALUES ($1, 'pending', $1) 
+         ON CONFLICT (sftp_file_name) DO NOTHING",
+        table_name
+    );
     
     let mut inserted = 0;
     for file_path in file_paths {
         let result = client
-            .execute(
-                "INSERT INTO file_transfers (sftp_file_name, status, storage_file_name) 
-                 VALUES ($1, 'pending', $1) 
-                 ON CONFLICT (sftp_file_name) DO NOTHING",
-                &[&file_path],
-            )
+            .execute(&query, &[&file_path])
             .await
             .context("Failed to insert file")?;
         
@@ -80,14 +86,16 @@ pub async fn insert_pending_files(pool: &Pool, file_paths: &[String]) -> Result<
 }
 
 /// Reset failed files to pending status
-pub async fn reset_failed_to_pending(pool: &Pool) -> Result<usize> {
+pub async fn reset_failed_to_pending(pool: &Pool, table_name: &str) -> Result<usize> {
     let client = pool.get().await.context("Failed to get database client")?;
     
+    let query = format!(
+        "UPDATE {} SET status = 'pending', error = NULL WHERE status = 'failed' OR status = 'running'",
+        table_name
+    );
+    
     let count = client
-        .execute(
-            "UPDATE file_transfers SET status = 'pending', error = NULL WHERE status = 'failed' OR status = 'running'",
-            &[],
-        )
+        .execute(&query, &[])
         .await
         .context("Failed to reset failed files")?;
     
@@ -97,7 +105,7 @@ pub async fn reset_failed_to_pending(pool: &Pool) -> Result<usize> {
 
 /// Claim next pending file atomically (changes status from pending to running)
 /// Uses SELECT FOR UPDATE SKIP LOCKED to prevent race conditions between workers/processes
-pub async fn claim_next_file(pool: &Pool) -> Result<Option<String>> {
+pub async fn claim_next_file(pool: &Pool, table_name: &str) -> Result<Option<String>> {
     let mut client = pool.get().await.context("Failed to get database client")?;
     
     let transaction = client
@@ -105,16 +113,18 @@ pub async fn claim_next_file(pool: &Pool) -> Result<Option<String>> {
         .await
         .context("Failed to start transaction")?;
     
+    let select_query = format!(
+        "SELECT sftp_file_name FROM {} 
+         WHERE status = 'pending' OR status = 'failed'
+         ORDER BY id 
+         LIMIT 1 
+         FOR UPDATE SKIP LOCKED",
+        table_name
+    );
+    
     // Find and lock a pending file
     let rows = transaction
-        .query(
-            "SELECT sftp_file_name FROM file_transfers 
-             WHERE status = 'pending' OR status = 'failed'
-             ORDER BY id 
-             LIMIT 1 
-             FOR UPDATE SKIP LOCKED",
-            &[],
-        )
+        .query(&select_query, &[])
         .await
         .context("Failed to select pending file")?;
     
@@ -125,14 +135,16 @@ pub async fn claim_next_file(pool: &Pool) -> Result<Option<String>> {
     
     let file_path: String = rows[0].get(0);
     
+    let update_query = format!(
+        "UPDATE {} 
+         SET status = 'running' 
+         WHERE sftp_file_name = $1",
+        table_name
+    );
+    
     // Update status to running
     transaction
-        .execute(
-            "UPDATE file_transfers 
-             SET status = 'running' 
-             WHERE sftp_file_name = $1",
-            &[&file_path],
-        )
+        .execute(&update_query, &[&file_path])
         .await
         .context("Failed to update file status to running")?;
     
@@ -142,16 +154,18 @@ pub async fn claim_next_file(pool: &Pool) -> Result<Option<String>> {
 }
 
 /// Mark file as completed
-pub async fn mark_completed(pool: &Pool, sftp_file_name: &str, storage_file_name: &str) -> Result<()> {
+pub async fn mark_completed(pool: &Pool, sftp_file_name: &str, storage_file_name: &str, table_name: &str) -> Result<()> {
     let client = pool.get().await.context("Failed to get database client")?;
     
+    let query = format!(
+        "UPDATE {} 
+         SET status = 'completed', storage_file_name = $1 
+         WHERE sftp_file_name = $2",
+        table_name
+    );
+    
     client
-        .execute(
-            "UPDATE file_transfers 
-             SET status = 'completed', storage_file_name = $1 
-             WHERE sftp_file_name = $2",
-            &[&storage_file_name, &sftp_file_name],
-        )
+        .execute(&query, &[&storage_file_name, &sftp_file_name])
         .await
         .context("Failed to mark file as completed")?;
     
@@ -159,16 +173,18 @@ pub async fn mark_completed(pool: &Pool, sftp_file_name: &str, storage_file_name
 }
 
 /// Mark file as failed with error message
-pub async fn mark_failed(pool: &Pool, sftp_file_name: &str, error_msg: &str) -> Result<()> {
+pub async fn mark_failed(pool: &Pool, sftp_file_name: &str, error_msg: &str, table_name: &str) -> Result<()> {
     let client = pool.get().await.context("Failed to get database client")?;
     
+    let query = format!(
+        "UPDATE {} 
+         SET status = 'failed', error = $1 
+         WHERE sftp_file_name = $2",
+        table_name
+    );
+    
     client
-        .execute(
-            "UPDATE file_transfers 
-             SET status = 'failed', error = $1 
-             WHERE sftp_file_name = $2",
-            &[&error_msg, &sftp_file_name],
-        )
+        .execute(&query, &[&error_msg, &sftp_file_name])
         .await
         .context("Failed to mark file as failed")?;
     
@@ -176,19 +192,21 @@ pub async fn mark_failed(pool: &Pool, sftp_file_name: &str, error_msg: &str) -> 
 }
 
 /// Get statistics of file transfers
-pub async fn get_stats(pool: &Pool) -> Result<(usize, usize, usize, usize)> {
+pub async fn get_stats(pool: &Pool, table_name: &str) -> Result<(usize, usize, usize, usize)> {
     let client = pool.get().await.context("Failed to get database client")?;
     
+    let query = format!(
+        "SELECT 
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'running') as running,
+            COUNT(*) FILTER (WHERE status = 'completed') as completed,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed
+         FROM {}",
+        table_name
+    );
+    
     let row = client
-        .query_one(
-            "SELECT 
-                COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                COUNT(*) FILTER (WHERE status = 'running') as running,
-                COUNT(*) FILTER (WHERE status = 'completed') as completed,
-                COUNT(*) FILTER (WHERE status = 'failed') as failed
-             FROM file_transfers",
-            &[],
-        )
+        .query_one(&query, &[])
         .await
         .context("Failed to get statistics")?;
     

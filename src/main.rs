@@ -55,6 +55,7 @@ struct Config {
     db_password: String,
     db_name: String,
     db_max_connections: usize,
+    db_table_name: String,
 }
 
 impl Config {
@@ -97,6 +98,7 @@ impl Config {
             db_max_connections: env::var("DB_MAX_CONNECTIONS")
                 .unwrap_or_else(|_| "20".to_string())
                 .parse()?,
+            db_table_name: env::var("DB_TABLE_NAME").unwrap_or_else(|_| "file_transfers".to_string()),
         })
     }
 }
@@ -117,12 +119,13 @@ async fn main() -> Result<()> {
         password: cfg.db_password.clone(),
         dbname: cfg.db_name.clone(),
         max_connections: cfg.db_max_connections,
+        table_name: cfg.db_table_name.clone(),
     };
     
     let db_pool = db::create_pool(&db_config).await?;
     
     // Initialize database schema (create tables if not exist)
-    db::init_schema(&db_pool).await?;
+    db::init_schema(&db_pool, &cfg.db_table_name).await?;
 
     // Connect to the bank sftp server to list files (initial connection)
     let initial_sftp = create_sftp_session(&cfg).await?;
@@ -137,10 +140,10 @@ async fn main() -> Result<()> {
     }
 
     // Insert all files as pending (if not already exist)
-    db::insert_pending_files(&db_pool, &all_files).await?;
+    db::insert_pending_files(&db_pool, &all_files, &cfg.db_table_name).await?;
     
     // Reset any failed files to pending (retry logic)
-    db::reset_failed_to_pending(&db_pool).await?;
+    db::reset_failed_to_pending(&db_pool, &cfg.db_table_name).await?;
     
     // Create semaphore to limit concurrent uploads
     let semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_uploads));
@@ -181,7 +184,7 @@ async fn main() -> Result<()> {
     }
     
     // Print final statistics
-    let (pending, running, completed, failed) = db::get_stats(&db_pool).await?;
+    let (pending, running, completed, failed) = db::get_stats(&db_pool, &cfg.db_table_name).await?;
     println!("\n=== Final Statistics ===");
     println!("Completed: {}", completed);
     println!("Failed: {}", failed);
@@ -221,7 +224,7 @@ async fn worker_task(
     
     loop {
         // Try to claim the next pending file from database
-        let file_path = match db::claim_next_file(&db_pool).await {
+        let file_path = match db::claim_next_file(&db_pool, &cfg.db_table_name).await {
             Ok(Some(path)) => path,
             Ok(None) => {
                 println!("[Worker {}] No more files to process, shutting down", worker_id);
@@ -250,7 +253,7 @@ async fn worker_task(
                 Err(e) => {
                     let error_msg = format!("Failed to create SFTP session: {}", e);
                     eprintln!("[Worker {}] {}", worker_id, error_msg);
-                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg, &cfg.db_table_name).await {
                         eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
                     }
                     continue;
@@ -270,7 +273,7 @@ async fn worker_task(
                 match upload_to_storage(worker_id, &cfg_file, Arc::clone(sftp), (*s3_client).clone()).await {
                     Ok(_) => {
                         println!("[Worker {}] Successfully uploaded: {}", worker_id, file_path);
-                        if let Err(e) = db::mark_completed(&db_pool, &file_path, &file_path).await {
+                        if let Err(e) = db::mark_completed(&db_pool, &file_path, &file_path, &cfg.db_table_name).await {
                             eprintln!("[Worker {}] Failed to mark file as completed in DB: {}", worker_id, e);
                         }
                         break; // Success, move to next file
@@ -301,7 +304,7 @@ async fn worker_task(
                                 }
                                 Err(e) => {
                                     eprintln!("[Worker {}] SFTP reconnection failed: {}", worker_id, e);
-                                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                                    if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg, &cfg.db_table_name).await {
                                         eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
                                     }
                                     break; // Give up on this file
@@ -309,7 +312,7 @@ async fn worker_task(
                             }
                         } else {
                             // Non-connection error or max retries reached
-                            if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                            if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg, &cfg.db_table_name).await {
                                 eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
                             }
                             break; // Move to next file
@@ -320,7 +323,7 @@ async fn worker_task(
                 // This shouldn't happen as we check above, but handle it anyway
                 let error_msg = "No SFTP session available".to_string();
                 eprintln!("[Worker {}] {}", worker_id, error_msg);
-                if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg).await {
+                if let Err(e) = db::mark_failed(&db_pool, &file_path, &error_msg, &cfg.db_table_name).await {
                     eprintln!("[Worker {}] Failed to mark file as failed in DB: {}", worker_id, e);
                 }
                 break;
@@ -328,7 +331,7 @@ async fn worker_task(
         }
         
         // Print current statistics
-        if let Ok((pending, running, completed, failed)) = db::get_stats(&db_pool).await {
+        if let Ok((pending, running, completed, failed)) = db::get_stats(&db_pool, &cfg.db_table_name).await {
             println!("[Worker {}] Progress: Pending={}, Running={}, Completed={}, Failed={}", 
                      worker_id, pending, running, completed, failed);
         }
